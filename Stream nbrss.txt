@@ -1,0 +1,1259 @@
+#!/usr/bin/env python3
+"""
+OTP Bot v5.1 - Aiogram-compatible full script
+Converted to aiogram v3 style handlers and imports.
+Features:
+ - CSV / TXT / XLSX upload (robust number extraction)
+ - /addadmin, /removeadmin, /listadmins commands (persisted)
+ - OTP message formatting per provided template (flag, short country, service shortcode)
+ - Language detection (basic script detection)
+ - OTP auto-delete after 3 minutes (deletes both original OTP in source channel and forwarded OTP in user chat)
+ - Keeps previous admin panel commands & UI intact
+Note: install requirements: aiogram, openpyxl, beautifulsoup4, requests
+"""
+import asyncio
+import csv
+import io
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import time
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+
+# optional xlsx support
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    OPENPYXL_AVAILABLE = False
+
+import requests
+from bs4 import BeautifulSoup
+
+from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Document,
+)
+from aiogram.filters import Command
+
+# ---------------------------- CONFIGURE HERE ----------------------------
+BOT_TOKEN = "8046083696:AAEY6Q0_1qiJ_X7u9dT8CPJm-ibtb74jUwo"            # <-- Put your bot token
+ADMINS = [7701278483]                         # <-- numeric Telegram IDs of initial admins
+CHANNEL_LINK = "https://t.me/streamvault24"   # default channel link used in numbers
+DB_PATH = "otp_stock.db"
+UPLOAD_DIR = "uploads"
+CHUNK_SIZE = 200000
+
+# The Telegram chat id of the OTP source channel where OTP messages land.
+OTP_CHANNEL_ID = -1002516783528  # <-- set your OTP channel id here
+# -----------------------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BANNER = r"""
+┌────────────────────────────────────────────┐
+│ 🚀 Stream OTP BOT (updated v5.1)            │
+│ ✨ Modern UI • AddAdmin • 3min AutoDelete  │
+└────────────────────────────────────────────┘
+"""
+print(BANNER)
+
+# ----------------- Prefix map (extendable) -----------------
+PREFIX_COUNTRY_MAP: Dict[str, Tuple[str, str]] = {
+    "1": ("United States", "🇺🇸"),
+    "7": ("Russia", "🇷🇺"),
+    "20": ("Egypt", "🇪🇬"),
+    "27": ("South Africa", "🇿🇦"),
+    "30": ("Greece", "🇬🇷"),
+    "31": ("Netherlands", "🇳🇱"),
+    "32": ("Belgium", "🇧🇪"),
+    "33": ("France", "🇫🇷"),
+    "34": ("Spain", "🇪🇸"),
+    "36": ("Hungary", "🇭🇺"),
+    "39": ("Italy", "🇮🇹"),
+    "40": ("Romania", "🇷🇴"),
+    "41": ("Switzerland", "🇨🇭"),
+    "43": ("Austria", "🇦🇹"),
+    "44": ("United Kingdom", "🇬🇧"),
+    "45": ("Denmark", "🇩🇰"),
+    "46": ("Sweden", "🇸🇪"),
+    "47": ("Norway", "🇳🇴"),
+    "48": ("Poland", "🇵🇱"),
+    "49": ("Germany", "🇩🇪"),
+    "51": ("Peru", "🇵🇪"),
+    "52": ("Mexico", "🇲🇽"),
+    "54": ("Argentina", "🇦🇷"),
+    "55": ("Brazil", "🇧🇷"),
+    "56": ("Chile", "🇨🇱"),
+    "57": ("Colombia", "🇨🇴"),
+    "60": ("Malaysia", "🇲🇾"),
+    "61": ("Australia", "🇦🇺"),
+    "62": ("Indonesia", "🇮🇩"),
+    "63": ("Philippines", "🇵🇭"),
+    "64": ("New Zealand", "🇳🇿"),
+    "65": ("Singapore", "🇸🇬"),
+    "66": ("Thailand", "🇹🇭"),
+    "81": ("Japan", "🇯🇵"),
+    "82": ("South Korea", "🇰🇷"),
+    "84": ("Vietnam", "🇻🇳"),
+    "86": ("China", "🇨🇳"),
+    "90": ("Turkey", "🇹🇷"),
+    "91": ("India", "🇮🇳"),
+    "92": ("Pakistan", "🇵🇰"),
+    "93": ("Afghanistan", "🇦🇫"),
+    "94": ("Sri Lanka", "🇱🇰"),
+    "95": ("Myanmar", "🇲🇲"),
+    "98": ("Iran", "🇮🇷"),
+    "211": ("South Sudan", "🇸🇸"),
+    "212": ("Morocco", "🇲🇦"),
+    "213": ("Algeria", "🇩🇿"),
+    "216": ("Tunisia", "🇹🇳"),
+    "218": ("Libya", "🇱🇾"),
+    "220": ("Gambia", "🇬🇲"),
+    "221": ("Senegal", "🇸🇳"),
+    "222": ("Mauritania", "🇲🇷"),
+    "223": ("Mali", "🇲🇱"),
+    "224": ("Guinea", "🇬🇳"),
+    "225": ("Ivory Coast", "🇨🇮"),
+    "226": ("Burkina Faso", "🇧🇫"),
+    "227": ("Niger", "🇳🇪"),
+    "228": ("Togo", "🇹🇬"),
+    "229": ("Benin", "🇧🇯"),
+    "230": ("Mauritius", "🇲🇺"),
+    "231": ("Liberia", "🇱🇷"),
+    "232": ("Sierra Leone", "🇸🇱"),
+    "233": ("Ghana", "🇬🇭"),
+    "234": ("Nigeria", "🇳🇬"),
+    "235": ("Chad", "🇹🇩"),
+    "236": ("Central African Republic", "🇨🇫"),
+    "237": ("Cameroon", "🇨🇲"),
+    "238": ("Cape Verde", "🇨🇻"),
+    "239": ("Sao Tome and Principe", "🇸🇹"),
+    "240": ("Equatorial Guinea", "🇬🇶"),
+    "241": ("Gabon", "🇬🇦"),
+    "242": ("Republic of the Congo", "🇨🇬"),
+    "243": ("DR Congo", "🇨🇩"),
+    "244": ("Angola", "🇦🇴"),
+    "245": ("Guinea-Bissau", "🇬🇼"),
+    "248": ("Seychelles", "🇸🇨"),
+    "249": ("Sudan", "🇸🇩"),
+    "250": ("Rwanda", "🇷🇼"),
+    "251": ("Ethiopia", "🇪🇹"),
+    "252": ("Somalia", "🇸🇴"),
+    "253": ("Djibouti", "🇩🇯"),
+    "254": ("Kenya", "🇰🇪"),
+    "255": ("Tanzania", "🇹🇿"),
+    "256": ("Uganda", "🇺🇬"),
+    "257": ("Burundi", "🇧🇮"),
+    "258": ("Mozambique", "🇲🇿"),
+    "260": ("Zambia", "🇿🇲"),
+    "261": ("Madagascar", "🇲🇬"),
+    "262": ("Reunion", "🇷🇪"),
+    "263": ("Zimbabwe", "🇿🇼"),
+    "264": ("Namibia", "🇳🇦"),
+    "265": ("Malawi", "🇲🇼"),
+    "266": ("Lesotho", "🇱🇸"),
+    "267": ("Botswana", "🇧🇼"),
+    "268": ("Eswatini", "🇸🇿"),
+    "269": ("Comoros", "🇰🇲"),
+    "350": ("Gibraltar", "🇬🇮"),
+    "351": ("Portugal", "🇵🇹"),
+    "352": ("Luxembourg", "🇱🇺"),
+    "353": ("Ireland", "🇮🇪"),
+    "354": ("Iceland", "🇮🇸"),
+    "355": ("Albania", "🇦🇱"),
+    "356": ("Malta", "🇲🇹"),
+    "357": ("Cyprus", "🇨🇾"),
+    "358": ("Finland", "🇫🇮"),
+    "359": ("Bulgaria", "🇧🇬"),
+    "370": ("Lithuania", "🇱🇹"),
+    "371": ("Latvia", "🇱🇻"),
+    "372": ("Estonia", "🇪🇪"),
+    "373": ("Moldova", "🇲🇩"),
+    "374": ("Armenia", "🇦🇲"),
+    "375": ("Belarus", "🇧🇾"),
+    "380": ("Ukraine", "🇺🇦"),
+    "381": ("Serbia", "🇷🇸"),
+    "385": ("Croatia", "🇭🇷"),
+    "386": ("Slovenia", "🇸🇮"),
+    "387": ("Bosnia and Herzegovina", "🇧🇦"),
+    "389": ("North Macedonia", "🇲🇰"),
+    "420": ("Czech Republic", "🇨🇿"),
+    "421": ("Slovakia", "🇸🇰"),
+    "423": ("Liechtenstein", "🇱🇮"),
+    "500": ("Falkland Islands", "🇫🇰"),
+    "501": ("Belize", "🇧🇿"),
+    "502": ("Guatemala", "🇬🇹"),
+    "503": ("El Salvador", "🇸🇻"),
+    "504": ("Honduras", "🇭🇳"),
+    "505": ("Nicaragua", "🇳🇮"),
+    "506": ("Costa Rica", "🇨🇷"),
+    "507": ("Panama", "🇵🇦"),
+    "509": ("Haiti", "🇭🇹"),
+    "591": ("Bolivia", "🇧🇴"),
+    "593": ("Ecuador", "🇪🇨"),
+    "595": ("Paraguay", "🇵🇾"),
+    "598": ("Uruguay", "🇺🇾"),
+    "670": ("Timor-Leste", "🇹🇱"),
+    "673": ("Brunei", "🇧🇳"),
+    "674": ("Nauru", "🇳🇷"),
+    "675": ("Papua New Guinea", "🇵🇬"),
+    "676": ("Tonga", "🇹🇴"),
+    "677": ("Solomon Islands", "🇸🇧"),
+    "678": ("Vanuatu", "🇻🇺"),
+    "679": ("Fiji", "🇫🇯"),
+    "682": ("Cook Islands", "🇨🇰"),
+    "683": ("Niue", "🇳🇺"),
+    "685": ("Samoa", "🇼🇸"),
+    "686": ("Kiribati", "🇰🇮"),
+    "687": ("New Caledonia", "🇳🇨"),
+    "688": ("Tuvalu", "🇹🇻"),
+    "690": ("Tokelau", "🇹🇰"),
+    "691": ("Micronesia", "🇫🇲"),
+    "692": ("Marshall Islands", "🇲🇭"),
+    "850": ("North Korea", "🇰🇵"),
+    "852": ("Hong Kong", "🇭🇰"),
+    "855": ("Cambodia", "🇰🇭"),
+    "856": ("Laos", "🇱🇦"),
+    "880": ("Bangladesh", "🇧🇩"),
+    "886": ("Taiwan", "🇹🇼"),
+    "960": ("Maldives", "🇲🇻"),
+    "961": ("Lebanon", "🇱🇧"),
+    "962": ("Jordan", "🇯🇴"),
+    "963": ("Syria", "🇸🇾"),
+    "964": ("Iraq", "🇮🇶"),
+    "965": ("Kuwait", "🇰🇼"),
+    "966": ("Saudi Arabia", "🇸🇦"),
+    "967": ("Yemen", "🇾🇪"),
+    "968": ("Oman", "🇴🇲"),
+    "970": ("Palestine", "🇵🇸"),
+    "971": ("United Arab Emirates", "🇦🇪"),
+    "972": ("Israel", "🇮🇱"),
+    "973": ("Bahrain", "🇧🇭"),
+    "974": ("Qatar", "🇶🇦"),
+    "975": ("Bhutan", "🇧🇹"),
+    "976": ("Mongolia", "🇲🇳"),
+    "977": ("Nepal", "🇳🇵"),
+}
+SORTED_PREFIXES = sorted(PREFIX_COUNTRY_MAP.keys(), key=lambda x: -len(x))
+
+
+# ------------------ Service shortcodes mapping ------------------
+SERVICE_SHORTCODES = {
+    "whatsapp": "W4P",
+    "wa": "W4P",
+    "wapp": "W4P",
+    "facebook": "F4B",
+    "fb": "F4B",
+    "instagram": "I4G",
+    "ig": "I4G",
+    "telegram": "T4G",
+    "tg": "T4G",
+    "google": "G4L",
+    "gmail": "G4L",
+    "twitter": "X4R",
+    "x": "X4R",
+    "snapchat": "S4P",
+    "snap": "S4P",
+    "imo": "I4M",
+    "tiktok": "T4K",
+    "microsoft": "M4S",
+    "ms": "M4S",
+    "amazon": "A4Z",
+    "apple": "A4P",
+}
+
+
+# ------------------ In-memory structures ------------------
+USER_LAST_NUMBER: Dict[int, str] = {}   # user_id -> full number (normalized)
+USER_COOLDOWN: Dict[int, float] = {}    # user_id -> last action timestamp
+COOLDOWN_SECONDS = 5                    # 5 second cooldown
+
+# ------------------ DB helpers ------------------
+def _init_db_sync(path: str):
+    conn = sqlite3.connect(path, timeout=30)
+    cur = conn.cursor()
+    # numbers table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS numbers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country TEXT,
+            flag TEXT,
+            number TEXT UNIQUE,
+            status TEXT CHECK(status IN ('free','used')) DEFAULT 'free',
+            used_by TEXT,
+            channel_link TEXT,
+            added_ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            used_ts DATETIME
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_country_status ON numbers(country, status);")
+    # logs table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event TEXT,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    # users table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            joined_ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_seen_ts DATETIME
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_userid ON users(user_id);")
+    # bot_admins table for persistence of dynamic admins
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            added_ts DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+async def init_db():
+    await asyncio.to_thread(_init_db_sync, DB_PATH)
+    # sync ADMINS constant into bot_admins table
+    def _sync_admins():
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        cur = conn.cursor()
+        for aid in ADMINS:
+            try:
+                cur.execute("INSERT OR IGNORE INTO bot_admins (user_id) VALUES (?)", (aid,))
+            except Exception:
+                pass
+        conn.commit()
+        rows = cur.execute("SELECT user_id FROM bot_admins").fetchall()
+        cur.close()
+        conn.close()
+        return [r[0] for r in rows]
+    rows = await asyncio.to_thread(_sync_admins)
+    global ADMINS
+    ADMINS = rows
+
+
+async def db_execute(query: str, params: tuple = ()):
+    def _sync():
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        conn.commit()
+        cur.close()
+        conn.close()
+    await asyncio.to_thread(_sync)
+
+
+async def db_fetchall(query: str, params: tuple = ()):
+    def _sync():
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    return await asyncio.to_thread(_sync)
+
+
+async def db_fetchone(query: str, params: tuple = ()):
+    def _sync():
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row
+    return await asyncio.to_thread(_sync)
+
+
+async def db_many_insert_numbers(rows: List[Tuple[str, str, str, str]]):
+    def _insert_chunk(chunk):
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        cur = conn.cursor()
+        for country, flag, number, channel_link in chunk:
+            try:
+                cur.execute(
+                    "INSERT OR IGNORE INTO numbers (country, flag, number, status, channel_link) VALUES (?, ?, ?, 'free', ?)",
+                    (country, flag, number, channel_link),
+                )
+            except Exception:
+                pass
+        conn.commit()
+        cur.close()
+        conn.close()
+    for i in range(0, len(rows), CHUNK_SIZE):
+        chunk = rows[i: i + CHUNK_SIZE]
+        await asyncio.to_thread(_insert_chunk, chunk)
+
+
+async def log_event(text: str):
+    try:
+        await db_execute("INSERT INTO logs (event) VALUES (?)", (text,))
+    except Exception:
+        logger.exception("Log failed: %s", text)
+
+
+# ---------------------- Utilities ----------------------
+def normalize_number(num: str) -> str:
+    if not num:
+        return ""
+    s = str(num).strip()
+    s = s.replace("(", "").replace(")", "").replace("-", " ").replace(".", " ")
+    s = s.replace("/", " ")
+    s = s.strip()
+    s = re.sub(r"[^\d+]", "", s)
+    s = s.lstrip("+")
+    s = re.sub(r"\A0+", "", s)
+    return re.sub(r"\D", "", s)
+
+
+def detect_country_by_prefix(number: str) -> Tuple[str, str]:
+    num = normalize_number(number)
+    for p in SORTED_PREFIXES:
+        if num.startswith(p):
+            return PREFIX_COUNTRY_MAP[p]
+    return ("Unknown", "🌐")
+
+
+def get_country_short(country_name: str) -> str:
+    if not country_name:
+        return "UN"
+    parts = re.split(r"[\s\-]+", country_name.strip())
+    if len(parts) >= 2:
+        short = (parts[0][0] + parts[1][0]).upper()
+    else:
+        short = (country_name[:2]).upper()
+    return short
+
+
+def mask_number_for_display_custom(num: str) -> str:
+    n = normalize_number(num)
+    if not n:
+        return num
+    start = n[:4]
+    end = n[-5:] if len(n) > 5 else n[-3:]
+    return f"{start}••••{end}"
+
+
+def format_phone(number: str) -> str:
+    n = normalize_number(number)
+    return f"+{n}" if n else number
+
+
+def extract_numbers_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+    found = set()
+    for m in re.findall(r"\+?\d[\d \-\.\u00A0\u200B]{4,}\d", text):
+        n = normalize_number(m)
+        if 6 <= len(n) <= 15:
+            found.add(n)
+    tokens = re.split(r"[^\d]+", text)
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        n = normalize_number(t)
+        if 6 <= len(n) <= 15:
+            found.add(n)
+    return list(found)
+
+
+def sniff_dialect(sample_bytes: bytes):
+    text = sample_bytes.decode("utf-8", errors="ignore")
+    try:
+        return csv.Sniffer().sniff(text)
+    except Exception:
+        class D(csv.excel):
+            delimiter = ","
+        return D()
+
+
+def parse_csv_bytes(content: bytes) -> List[dict]:
+    sample = content[:4096]
+    dialect = sniff_dialect(sample)
+    text = content.decode("utf-8", errors="replace")
+    f = io.StringIO(text)
+    reader = csv.DictReader(f, dialect=dialect)
+    out = []
+    for row in reader:
+        normalized = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        out.append(normalized)
+    return out
+
+
+def extract_number_from_row(row: dict) -> Optional[str]:
+    keys = ["number", "phone", "phone_number", "mobile", "msisdn", "tel", "telephone", "range", "prefix"]
+    for k in keys:
+        if k in row and row[k]:
+            val = row[k]
+            if k == "range" and "-" in val:
+                left = val.split("-")[0].strip()
+                n = normalize_number(left)
+                if len(n) >= 6:
+                    return n
+            m = re.search(r"(\+?\d{6,15})", val)
+            if m:
+                return normalize_number(m.group(1))
+            n = normalize_number(val)
+            if len(n) >= 6:
+                return n
+    for v in row.values():
+        if not v:
+            continue
+        m = re.search(r"(\+?\d{6,15})", v)
+        if m:
+            return normalize_number(m.group(1))
+    return None
+
+
+def detect_service_short(text: str) -> str:
+    if not text:
+        return "UNK"
+    tl = text.lower()
+    for key, sc in SERVICE_SHORTCODES.items():
+        if re.search(r"\b" + re.escape(key) + r"\b", tl):
+            return sc
+    return "UNK"
+
+
+def detect_language_label(text: str) -> str:
+    if not text:
+        return "English"
+    if re.search(r"[\u0600-\u06FF]", text):
+        return "Arabic"
+    if re.search(r"[\u0900-\u097F]", text):
+        return "Hindi"
+    if re.search(r"[\u0400-\u04FF]", text):
+        return "Russian"
+    return "English"
+
+
+def format_otp_label(otp: str) -> str:
+    if not otp:
+        return ""
+    digits = re.sub(r"\D", "", otp)
+    L = len(digits)
+    if L == 6:
+        return f"{digits[:3]}-{digits[3:]}"
+    if L == 5:
+        return f"{digits[:3]}-{digits[3:]}"
+    if L == 4:
+        return f"{digits[:2]}-{digits[2:]}"
+    parts = [digits[i:i+3] for i in range(0, L, 3)]
+    return "-".join(parts)
+
+
+# ---------------------- Bot Handlers (aiogram style) ----------------------
+async def add_or_update_user(user_id: int, username: Optional[str], first_name: Optional[str]):
+    ts = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+    await db_execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_ts, last_seen_ts) VALUES (?, ?, ?, ?, ?)",
+        (user_id, username or "", first_name or "", ts, ts),
+    )
+    await db_execute("UPDATE users SET username=?, first_name=?, last_seen_ts=? WHERE user_id=?", (username or "", first_name or "", ts, user_id))
+
+
+async def get_users_count_and_recent(limit=5):
+    total = (await db_fetchone("SELECT COUNT(*) FROM users"))[0] or 0
+    rows = await db_fetchall("SELECT user_id, username, first_name, joined_ts FROM users ORDER BY joined_ts DESC LIMIT ?", (limit,))
+    return total, rows
+
+
+# aiogram handler equivalents
+async def start_handler(message: Message):
+    user = message.from_user
+    await add_or_update_user(user.id, user.username, user.first_name)
+    await log_event(f"/start by {user.id} @{user.username or ''}")
+
+    rows = await db_fetchall("SELECT country, flag, COUNT(*) FROM numbers WHERE status='free' GROUP BY country, flag ORDER BY COUNT(*) DESC")
+    kb = []
+    if not rows:
+        kb = [[InlineKeyboardButton("📦 No stock available", callback_data="no_stock")]]
+        text = "📦 No stock available. Admin can upload CSV with /admin."
+    else:
+        for country, flag, cnt in rows:
+            kb.append([InlineKeyboardButton(f"{flag} {country} — {cnt}", callback_data=f"country|{country}")])
+        kb.append([InlineKeyboardButton("❓ Help", callback_data="help")])
+        text = "🌍 Select a country to get a number:"
+    await message.answer(text=text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def help_handler(message: Message):
+    await message.reply(
+        "/start - list countries & get number\n"
+        "/admin - admin panel (admin only)\n"
+        "/addadmin <user_id> - add admin (admin only)\n"
+        "/removeadmin <user_id> - remove admin (admin only)\n"
+        "/listadmins - list admins\n"
+        "/broadcast <text> - (admin) send broadcast to all users\n"
+        "After receiving a number press 'Get OTP' to open the configured channel."
+    )
+
+
+async def admin_only_check(user_id: int) -> bool:
+    return user_id in ADMINS
+
+
+# Admin management commands for aiogram
+async def cmd_addadmin(message: Message):
+    sender = message.from_user
+    if not await admin_only_check(sender.id):
+        await message.reply("❌ Not authorized to add admins.")
+        await log_event(f"Unauthorized addadmin attempt by {sender.id}")
+        return
+    args = message.get_arguments().split() if message.get_arguments() else []
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif args:
+        try:
+            target_id = int(args[0])
+        except Exception:
+            await message.reply("Usage: /addadmin <user_id> or reply to user message")
+            return
+    else:
+        await message.reply("Usage: /addadmin <user_id> or reply to user message")
+        return
+    try:
+        await db_execute("INSERT OR IGNORE INTO bot_admins (user_id) VALUES (?)", (target_id,))
+        rows = await db_fetchall("SELECT user_id FROM bot_admins")
+        global ADMINS
+        ADMINS = [r[0] for r in rows]
+        await message.reply(f"✅ Added admin: {target_id}")
+        await log_event(f"Admin {sender.id} added admin {target_id}")
+    except Exception as e:
+        await message.reply(f"Failed to add admin: {e}")
+
+
+async def cmd_removeadmin(message: Message):
+    sender = message.from_user
+    if not await admin_only_check(sender.id):
+        await message.reply("❌ Not authorized to remove admins.")
+        await log_event(f"Unauthorized removeadmin attempt by {sender.id}")
+        return
+    args = message.get_arguments().split() if message.get_arguments() else []
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif args:
+        try:
+            target_id = int(args[0])
+        except Exception:
+            await message.reply("Usage: /removeadmin <user_id> or reply to user message")
+            return
+    else:
+        await message.reply("Usage: /removeadmin <user_id> or reply to user message")
+        return
+    try:
+        await db_execute("DELETE FROM bot_admins WHERE user_id=?", (target_id,))
+        rows = await db_fetchall("SELECT user_id FROM bot_admins")
+        global ADMINS
+        ADMINS = [r[0] for r in rows]
+        await message.reply(f"✅ Removed admin: {target_id}")
+        await log_event(f"Admin {sender.id} removed admin {target_id}")
+    except Exception as e:
+        await message.reply(f"Failed to remove admin: {e}")
+
+
+async def cmd_listadmins(message: Message):
+    rows = await db_fetchall("SELECT user_id FROM bot_admins")
+    if not rows:
+        await message.reply("No admins found.")
+        return
+    lines = ["Admins:"]
+    for r in rows:
+        lines.append(str(r[0]))
+    await message.reply("\n".join(lines))
+
+
+# Callback handler
+async def callback_handler(callback: CallbackQuery):
+    await callback.answer()
+    data = callback.data or ""
+    user = callback.from_user
+    user_id = user.id
+
+    now = time.time()
+    last = USER_COOLDOWN.get(user_id, 0)
+    if now - last < COOLDOWN_SECONDS:
+        wait = int(COOLDOWN_SECONDS - (now - last))
+        await callback.answer(f"⏳ Wait {wait}s...", show_alert=True)
+        return
+    USER_COOLDOWN[user_id] = now
+
+    if data == "no_stock":
+        await callback.edit_message_text("No stock. Admin can upload via /admin.")
+        return
+    if data == "help":
+        await callback.edit_message_text("Use /start to get a number or /admin (admin only).")
+        return
+    if data == "back_home":
+        await start_handler(callback.message)
+        return
+    if data.startswith("country|"):
+        country = data.split("|", 1)[1]
+        row = await db_fetchone(
+            "SELECT id, number, channel_link, flag FROM numbers WHERE country=? AND status='free' ORDER BY id LIMIT 1",
+            (country,),
+        )
+        if not row:
+            await callback.edit_message_text("📦 No stock available for this country.")
+            return
+        num_id, number, channel_link, flag = row
+        used_by = f"{user.username or user.full_name} ({user.id})"
+        ts = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+        await db_execute(
+            "UPDATE numbers SET status='used', used_by=?, used_ts=? WHERE id=?",
+            (used_by, ts, num_id),
+        )
+        await log_event(f"User {user.id} received {number} ({country})")
+        USER_LAST_NUMBER[user_id] = normalize_number(number)
+        display = (
+            f"✨ *Your Virtual Number is Ready!*\n\n"
+            f"📞 *Number:* `{format_phone(number)}`\n"
+            f"🌍 *Country:* {country} {flag}\n"
+            f"⏱️ *Issued:* {datetime.utcnow().strftime('%d-%b-%Y %H:%M')} UTC\n\n"
+            f"🔐 Use this number to receive OTP instantly."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton("🌎 Change Country", callback_data="back_home"),
+             InlineKeyboardButton("🔁 New Number", callback_data=f"change|{country}")],
+            [InlineKeyboardButton("✉️ Get OTP", url=channel_link or CHANNEL_LINK)]
+        ])
+        await callback.edit_message_text(display, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+    if data.startswith("change|"):
+        country = data.split("|", 1)[1]
+        new_row = await db_fetchone(
+            "SELECT id, number, flag FROM numbers WHERE country=? AND status='free' ORDER BY id LIMIT 1",
+            (country,),
+        )
+        if not new_row:
+            await callback.edit_message_text(f"❌ No more free numbers for {country}.")
+            return
+        num_id, number, flag = new_row
+        used_by = f"{user.username or user.full_name} ({user.id})"
+        ts = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
+        await db_execute(
+            "UPDATE numbers SET status='used', used_by=?, used_ts=? WHERE id=?",
+            (used_by, ts, num_id),
+        )
+        await log_event(f"User {user.id} changed number -> {number} ({country})")
+        USER_LAST_NUMBER[user_id] = normalize_number(number)
+        display = (
+            f"🔁 *New Number Assigned*\n\n"
+            f"📞 *Number:* `{format_phone(number)}`\n"
+            f"🌍 *{country} {flag}*\n"
+            f"⏱️ *Issued:* {datetime.utcnow().strftime('%d-%b-%Y %H:%M')} UTC"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton("🌎 Change Country", callback_data="back_home"),
+             InlineKeyboardButton("🔁 New Number", callback_data=f"change|{country}")],
+            [InlineKeyboardButton("✉️ Get OTP", url=CHANNEL_LINK),
+             InlineKeyboardButton("🔙 Back Home", callback_data="back_home")]
+        ])
+        await callback.edit_message_text(display, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+    await callback.edit_message_text("Unknown action. Use /start or /help.")
+
+
+# Admin panel constants
+ADMIN_TEXT = "Stream Panel"
+ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton("📤 Upload CSV/XLSX/TXT", callback_data="admin|upload"),
+     InlineKeyboardButton("📦 View Stock", callback_data="admin|view")],
+    [InlineKeyboardButton("➕ Add Number", callback_data="admin|add"),
+     InlineKeyboardButton("🗑️ Delete Country", callback_data="admin|delete")],
+    [InlineKeyboardButton("📊 Stats", callback_data="admin|stats"),
+     InlineKeyboardButton("🪵 View Logs", callback_data="admin|logs")],
+    [InlineKeyboardButton("👥 Users", callback_data="admin|users"),
+     InlineKeyboardButton("📣 Broadcast", callback_data="admin|broadcast")]
+])
+
+
+async def admin_command(message: Message):
+    user = message.from_user
+    if not await admin_only_check(user.id):
+        await message.reply("❌ Not authorized.")
+        await log_event(f"Unauthorized /admin attempt by {user.id}")
+        return
+    await message.reply(ADMIN_TEXT, reply_markup=ADMIN_KB)
+
+
+async def admin_callback_handler(callback: CallbackQuery):
+    await callback.answer()
+    data = callback.data or ""
+    user = callback.from_user
+    if not await admin_only_check(user.id):
+        await callback.edit_message_text("❌ Not authorized.")
+        return
+    if data == "admin|upload":
+        dispatcher_data.setdefault("awaiting_csv", set()).add(user.id)
+        await callback.edit_message_text("📤 Send the CSV / TXT / XLSX file now (attach as file).")
+        return
+    if data == "admin|view":
+        txt = await get_stock_summary()
+        await callback.edit_message_text(txt, reply_markup=ADMIN_KB)
+        return
+    if data == "admin|stats":
+        total = (await db_fetchone("SELECT COUNT(*) FROM numbers"))[0] or 0
+        used = (await db_fetchone("SELECT COUNT(*) FROM numbers WHERE status='used'"))[0] or 0
+        free = (await db_fetchone("SELECT COUNT(*) FROM numbers WHERE status='free'"))[0] or 0
+        await callback.edit_message_text(f"📊 Stats\nTotal: {total}\nUsed: {used}\nFree: {free}", reply_markup=ADMIN_KB)
+        return
+    if data == "admin|add":
+        dispatcher_data.setdefault("awaiting_manual_add", set()).add(user.id)
+        await callback.edit_message_text("➕ Send a single number (e.g. +254700123456)")
+        return
+    if data == "admin|delete":
+        rows = await db_fetchall("SELECT DISTINCT country, flag FROM numbers")
+        if not rows:
+            await callback.edit_message_text("No countries found.", reply_markup=ADMIN_KB)
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(f"{flag} {country}", callback_data=f"admin|delete|{country}")] for country, flag in rows] + [[InlineKeyboardButton("Cancel", callback_data="admin|cancel")]])
+        await callback.edit_message_text("🗑️ Select country to delete all numbers:", reply_markup=kb)
+        return
+    if data.startswith("admin|delete|"):
+        country = data.split("|",2)[2]
+        c = (await db_fetchone("SELECT COUNT(*) FROM numbers WHERE country=?", (country,)))[0] or 0
+        await db_execute("DELETE FROM numbers WHERE country=?", (country,))
+        await log_event(f"Admin {user.id} deleted {c} numbers for {country}")
+        await callback.edit_message_text(f"🗑️ Deleted {c} numbers for {country}", reply_markup=ADMIN_KB)
+        return
+    if data == "admin|logs":
+        rows = await db_fetchall("SELECT ts, event FROM logs ORDER BY id DESC LIMIT 40")
+        if not rows:
+            await callback.edit_message_text("No logs.", reply_markup=ADMIN_KB)
+            return
+        lines = [f"[{ts}] {ev}" for ts, ev in rows]
+        text = "🪵 Recent logs:\n" + "\n".join(lines[:30])
+        await callback.edit_message_text(text, reply_markup=ADMIN_KB)
+        return
+    if data == "admin|cancel":
+        await callback.edit_message_text(ADMIN_TEXT, reply_markup=ADMIN_KB)
+        dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+        dispatcher_data.get("awaiting_manual_add", set()).discard(user.id)
+        return
+    if data == "admin|users":
+        total, rows = await get_users_count_and_recent(limit=10)
+        lines = [f"👥 Registered Users: {total}", ""]
+        for i, (uid, uname, fname, joined_ts) in enumerate(rows, start=1):
+            uname_display = f"@{uname}" if uname else fname or str(uid)
+            lines.append(f"{i}. {uname_display} ({uid}) — joined {joined_ts}")
+        text = "\n".join(lines)
+        await callback.edit_message_text(text, reply_markup=ADMIN_KB)
+        return
+    if data == "admin|broadcast":
+        dispatcher_data.setdefault("awaiting_broadcast", set()).add(user.id)
+        await callback.edit_message_text("📣 Send the broadcast message now (text only).")
+        return
+
+
+async def get_stock_summary() -> str:
+    rows = await db_fetchall("SELECT country, flag, COUNT(*) FROM numbers WHERE status='free' GROUP BY country, flag ORDER BY COUNT(*) DESC")
+    if not rows:
+        return "📦 No stock."
+    lines = ["📦 Current Stock:"]
+    for country, flag, cnt in rows:
+        lines.append(f"{flag} {country} — {cnt}")
+    return "\n".join(lines)
+
+
+# Simple in-memory dispatcher-scoped data for awaiting flags
+dispatcher_data: Dict[str, set] = {}
+
+# Document handler and upload logic
+async def document_handler(message: Message):
+    user = message.from_user
+    if not await admin_only_check(user.id):
+        await message.reply("❌ Not authorized to upload.")
+        return
+    if user.id not in dispatcher_data.get("awaiting_csv", set()):
+        await message.reply("Please choose Upload CSV from /admin first.")
+        return
+    doc: Document = message.document
+    if not doc:
+        await message.reply("No document attached.")
+        return
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    fname = f"{int(time.time())}_{doc.file_name or 'upload'}"
+    fpath = os.path.join(UPLOAD_DIR, fname)
+
+    try:
+        file = await bot.get_file(doc.file_id)
+    except Exception as e:
+        await message.reply(f"Download failed: {e}")
+        await log_event(f"File get failed by admin {user.id}: {e}")
+        dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+        return
+
+    lower_name = (doc.file_name or "").lower()
+
+    if lower_name.endswith(".txt"):
+        try:
+            raw = await file.download_as_bytearray()
+            text = raw.decode("utf-8", errors="ignore")
+            nums = extract_numbers_from_text(text)
+            rows_to_insert = []
+            for num in nums:
+                country, flag = detect_country_by_prefix(num)
+                rows_to_insert.append((country, flag, num, CHANNEL_LINK))
+            if rows_to_insert:
+                await db_many_insert_numbers(rows_to_insert)
+            await message.reply(f"✅ Imported {len(rows_to_insert)} numbers from TXT.")
+            await log_event(f"Admin {user.id} uploaded TXT: {len(rows_to_insert)} inserted")
+        except Exception as e:
+            await message.reply(f"TXT processing failed: {e}")
+            await log_event(f"TXT processing failed by admin {user.id}: {e}")
+        finally:
+            dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+        return
+
+    if lower_name.endswith(".xlsx") or lower_name.endswith(".xls"):
+        if not OPENPYXL_AVAILABLE:
+            await message.reply("❌ XLSX support not available on this server. Install openpyxl.")
+            dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+            await log_event(f"Admin {user.id} attempted XLSX upload but openpyxl missing")
+            return
+        try:
+            await file.download_to_drive(custom_path=fpath)
+            nums = set()
+            wb = openpyxl.load_workbook(fpath, data_only=True)
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(values_only=True):
+                    for cell in row:
+                        if cell is None:
+                            continue
+                        if isinstance(cell, str):
+                            found = extract_numbers_from_text(cell)
+                            for n in found:
+                                nums.add(n)
+                        else:
+                            try:
+                                n = normalize_number(str(cell))
+                                if 6 <= len(n) <= 15:
+                                    nums.add(n)
+                            except Exception:
+                                pass
+            rows_to_insert = []
+            for num in nums:
+                country, flag = detect_country_by_prefix(num)
+                rows_to_insert.append((country, flag, num, CHANNEL_LINK))
+            if rows_to_insert:
+                await db_many_insert_numbers(rows_to_insert)
+            await message.reply(f"✅ Imported {len(rows_to_insert)} numbers from XLSX.")
+            await log_event(f"Admin {user.id} uploaded XLSX: {len(rows_to_insert)} inserted")
+        except Exception as e:
+            await message.reply(f"XLSX processing failed: {e}")
+            await log_event(f"XLSX processing failed by admin {user.id}: {e}")
+        finally:
+            try:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+            except Exception:
+                pass
+            dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+        return
+
+    # CSV / fallback
+    try:
+        await file.download_to_drive(custom_path=fpath)
+    except Exception as e:
+        await message.reply(f"Download failed: {e}")
+        await log_event(f"CSV download failed by admin {user.id}: {e}")
+        dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+        return
+
+    try:
+        with open(fpath, "rb") as fh:
+            raw = fh.read()
+        parsed = parse_csv_bytes(raw)
+    except Exception as e:
+        parsed = []
+        await log_event(f"CSV parse failed by admin {user.id}: {e}")
+
+    rows_to_insert = []
+    processed = 0
+    skipped = 0
+    unknown_examples = set()
+
+    if parsed:
+        for row in parsed:
+            num = extract_number_from_row(row)
+            if not num:
+                skipped += 1
+                continue
+            country, flag = detect_country_by_prefix(num)
+            if country == "Unknown":
+                unknown_examples.add(num[:4])
+            rows_to_insert.append((country, flag, num, CHANNEL_LINK))
+            processed += 1
+    else:
+        try:
+            with open(fpath, "rb") as fh:
+                txt = fh.read().decode("utf-8", errors="ignore")
+            nums = extract_numbers_from_text(txt)
+            for n in nums:
+                country, flag = detect_country_by_prefix(n)
+                rows_to_insert.append((country, flag, n, CHANNEL_LINK))
+            processed = len(rows_to_insert)
+        except Exception as e:
+            await log_event(f"Fallback parse failed for admin {user.id}: {e}")
+
+    if rows_to_insert:
+        await db_many_insert_numbers(rows_to_insert)
+
+    summary_lines = [f"✅ Imported {processed} numbers. (Skipped {skipped})"]
+    if processed:
+        counts = {}
+        for country, flag, number, ch in rows_to_insert:
+            counts.setdefault((country, flag), 0)
+            counts[(country, flag)] += 1
+        summary_lines.append("\n📦 Stock summary:")
+        for (country, flag), cnt in sorted(counts.items(), key=lambda x: -x[1]):
+            summary_lines.append(f"{flag} {country} — {cnt}")
+    if unknown_examples:
+        summary_lines.append("\n⚠️ Unknown prefixes (examples): " + ", ".join(list(unknown_examples)[:10]))
+
+    await message.reply("\n".join(summary_lines))
+    await log_event(f"Admin {user.id} uploaded file: {processed} inserted, {skipped} skipped")
+    try:
+        if os.path.exists(fpath):
+            os.remove(fpath)
+    except Exception:
+        pass
+    dispatcher_data.get("awaiting_csv", set()).discard(user.id)
+
+
+async def text_handler(message: Message):
+    user = message.from_user
+    txt = (message.text or "").strip()
+
+    if user.id in dispatcher_data.get("awaiting_manual_add", set()) and await admin_only_check(user.id):
+        n = normalize_number(txt)
+        if not n or len(n) < 6:
+            await message.reply("❌ Can't parse number. Send e.g. +254700123456")
+            return
+        country, flag = detect_country_by_prefix(n)
+        await db_many_insert_numbers([(country, flag, n, CHANNEL_LINK)])
+        await message.reply(f"✅ Added {format_phone(n)} to {country} {flag}")
+        await log_event(f"Admin {user.id} added {n} to {country}")
+        dispatcher_data.get("awaiting_manual_add", set()).discard(user.id)
+        return
+
+    if user.id in dispatcher_data.get("awaiting_broadcast", set()) and await admin_only_check(user.id):
+        msg = txt
+        dispatcher_data.get("awaiting_broadcast", set()).discard(user.id)
+        await message.reply("📣 Broadcasting message...")
+        await send_broadcast_to_all(msg, origin_admin=user.id)
+        await message.reply("✅ Broadcast finished.")
+        return
+
+    if txt.lower().startswith("/broadcast") and await admin_only_check(user.id):
+        parts = txt.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.reply("Usage: /broadcast Your message here")
+            return
+        msg = parts[1].strip()
+        await message.reply("📣 Broadcasting message...")
+        await send_broadcast_to_all(msg, origin_admin=user.id)
+        await message.reply("✅ Broadcast finished.")
+        return
+
+    await message.reply("Send /start to get a number or /help.")
+
+
+async def send_broadcast_to_all(message_text: str, origin_admin: Optional[int] = None):
+    rows = await db_fetchall("SELECT user_id FROM users")
+    user_ids = [r[0] for r in rows]
+    total = len(user_ids)
+    await log_event(f"Broadcast initiated by {origin_admin}: {len(user_ids)} recipients")
+    sent = 0
+    failed = 0
+    for i, uid in enumerate(user_ids, start=1):
+        try:
+            await bot.send_message(chat_id=uid, text=message_text)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            await log_event(f"Broadcast to {uid} failed: {e}")
+        await asyncio.sleep(0.05)
+    await log_event(f"Broadcast finished: sent={sent}, failed={failed}, total={total}")
+
+
+async def error_handler(update: Any, exception: Exception):
+    try:
+        text = f"Exception: {exception} | Update: {getattr(update, 'update_id', 'n/a')}"
+        logger.exception(text)
+        await log_event(text)
+    except Exception:
+        pass
+
+
+def auto_backup_db():
+    try:
+        Path("backups").mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        backup_file = f"backups/otp_stock_{timestamp}.db"
+        if os.path.exists(DB_PATH):
+            shutil.copy(DB_PATH, backup_file)
+            logger.info(f"Backup created: {backup_file}")
+        now = time.time()
+        for f in Path("backups").glob("otp_stock_*.db"):
+            if now - f.stat().st_mtime > 3 * 86400:
+                try:
+                    f.unlink()
+                    logger.info(f"Old backup deleted: {f.name}")
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.exception("Backup failed: %s", e)
+
+
+async def periodic_backup(interval_hours=6):
+    while True:
+        await asyncio.sleep(interval_hours * 3600)
+        auto_backup_db()
+
+
+# OTP auto-forward handler (message from source channel)
+async def otp_auto_forward(message: Message):
+    # only process messages from the OTP source channel
+    if message.chat.id != OTP_CHANNEL_ID:
+        return
+    text = message.text or message.caption or ""
+    if not text:
+        return
+    # extract number and otp
+    num_match = re.search(r"(\+?\d{6,15})", text)
+    extracted_number = normalize_number(num_match.group(1)) if num_match else None
+    masked_start = None
+    masked_end = None
+    m = re.search(r"(\d{2,4})\D{1,6}(\d{2,4})", text)
+    if m:
+        masked_start = m.group(1)
+        masked_end = m.group(2)
+    otp_match = re.search(r"\b(\d{4,8})\b", text)
+    otp = otp_match.group(1) if otp_match else None
+    if not otp:
+        await log_event(f"OTP parse failed for message: {text[:60]}")
+        return
+    matched_users = []
+    if extracted_number:
+        for uid, fullnum in USER_LAST_NUMBER.items():
+            if fullnum.endswith(extracted_number) or fullnum == extracted_number or fullnum.startswith(extracted_number):
+                matched_users.append((uid, fullnum))
+    if not matched_users and masked_start and masked_end:
+        for uid, fullnum in USER_LAST_NUMBER.items():
+            if fullnum.startswith(masked_start) and fullnum.endswith(masked_end):
+                matched_users.append((uid, fullnum))
+    if not matched_users:
+        last_digits_match = re.search(r"(\d{2,4})\b", text)
+        if last_digits_match:
+            lastd = last_digits_match.group(1)
+            for uid, fullnum in USER_LAST_NUMBER.items():
+                if fullnum.endswith(lastd):
+                    matched_users.append((uid, fullnum))
+    if not matched_users:
+        await log_event(f"No user match for OTP message: OTP={otp} text={text[:80]}")
+        return
+    for uid, fullnum in matched_users:
+        try:
+            service_code = detect_service_short(text)
+            lang_label = detect_language_label(text)
+            country, flag = detect_country_by_prefix(fullnum)
+            country_short = get_country_short(country)
+            masked_display = mask_number_for_display_custom(fullnum)
+            otp_display = format_otp_label(otp)
+            top_line = f"{flag} #{country_short} ! {service_code}:{masked_display} {lang_label}"
+            code_label = "C0D4"
+            second_line = f"{code_label} - {otp_display}"
+            final_msg = f"{top_line}\n\n{second_line}"
+            sent = await bot.send_message(chat_id=uid, text=final_msg)
+            await log_event(f"Forwarded OTP {otp} to {uid} for number {fullnum}")
+            async def delete_after_delay(original_chat_id: int, original_message_id: int, forward_chat_id: int, forward_message_id: int, delay: int = 180):
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    return
+                try:
+                    await bot.delete_message(chat_id=forward_chat_id, message_id=forward_message_id)
+                except Exception as e:
+                    await log_event(f"Failed to delete forwarded OTP msg {forward_chat_id}/{forward_message_id}: {e}")
+                try:
+                    await bot.delete_message(chat_id=original_chat_id, message_id=original_message_id)
+                except Exception as e:
+                    await log_event(f"Failed to delete original OTP msg {original_chat_id}/{original_message_id}: {e}")
+            try:
+                asyncio.create_task(delete_after_delay(message.chat.id, message.message_id, sent.chat.id, sent.message_id, 180))
+            except Exception as e:
+                await log_event(f"Failed to schedule delete task: {e}")
+        except Exception as e:
+            await log_event(f"Forward failed to {uid}: {e}")
+
+
+# ------------------ Startup & Dispatcher registration ------------------
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# register handlers
+dp.message.register(start_handler, Command(commands=["start"]))
+dp.message.register(help_handler, Command(commands=["help"]))
+dp.message.register(admin_command, Command(commands=["admin"]))
+dp.message.register(cmd_addadmin, Command(commands=["addadmin"]))
+dp.message.register(cmd_removeadmin, Command(commands=["removeadmin"]))
+dp.message.register(cmd_listadmins, Command(commands=["listadmins"]))
+dp.message.register(text_handler)  # fallback text handler
+dp.message.register(document_handler, lambda message: message.document is not None)
+dp.message.register(otp_auto_forward, lambda message: message.chat.id == OTP_CHANNEL_ID)
+
+dp.callback_query.register(callback_handler)
+dp.callback_query.register(admin_callback_handler, lambda c: c.data and c.data.startswith("admin|"))
+
+async def main():
+    await init_db()
+    auto_backup_db()
+    asyncio.create_task(periodic_backup(6))
+    # Start polling
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Shutting down")
+  
